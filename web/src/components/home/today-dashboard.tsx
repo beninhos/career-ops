@@ -30,6 +30,7 @@ export function TodayDashboard({
   const [followups, setFollowups] = useState<FollowUp[]>([]);
   const [overdue, setOverdue] = useState(0);
   const [fresh, setFresh] = useState<DiscoveredOffer[]>([]);
+  const [freshCount, setFreshCount] = useState(0);
   const router = useRouter();
   const dateLabel = useMemo(() => new Date().toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" }), []);
 
@@ -43,7 +44,12 @@ export function TodayDashboard({
       .catch(() => {});
     fetch("/api/whats-new")
       .then((r) => r.json())
-      .then((d) => setFresh(Array.isArray(d.offers) ? d.offers : []))
+      .then((d) => {
+        const offers = Array.isArray(d.offers) ? d.offers : [];
+        const count = Number(d.count);
+        setFresh(offers);
+        setFreshCount(Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : offers.length);
+      })
       .catch(() => {});
   }, []);
 
@@ -66,7 +72,7 @@ export function TodayDashboard({
     [applications],
   );
 
-  const newThisWeek = fresh.length;
+  const newThisWeek = freshCount;
   const allClear = newThisWeek === 0 && overdue === 0 && awaiting.length === 0;
   const inboxUrls = useMemo(() => new Set(inbox.map((j) => j.url)), [inbox]);
 
@@ -103,10 +109,10 @@ export function TodayDashboard({
             {allClear ? "I'll keep scanning the market in the background and surface anything that fits." : "Your action queue for today — discovery and follow-ups, in one place."}
           </p>
           <div className="mt-6 flex flex-wrap gap-2.5">
-            <Link href="/explore" className="inline-flex items-center gap-2 rounded-full bg-brand px-5 py-2.5 text-sm font-medium text-brand-foreground transition hover:bg-brand-200">
+            <Link href="/explore" className="inline-flex items-center gap-2 rounded-full bg-brand px-5 py-2.5 text-sm font-medium text-brand-foreground transition hover:bg-brand-200 max-sm:min-h-[44px]">
               Find new roles <ArrowRight className="size-4" />
             </Link>
-            <Link href="/pipeline" className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2.5 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand">
+            <Link href="/pipeline" className="inline-flex items-center gap-2 rounded-full border border-border px-5 py-2.5 text-sm font-medium text-foreground transition hover:border-brand/40 hover:text-brand max-sm:min-h-[44px]">
               Open pipeline
             </Link>
           </div>
@@ -145,8 +151,8 @@ export function TodayDashboard({
             ))}
           </div>
           {fresh.length > 6 && (
-            <Link href="/explore" className="mt-3 inline-block text-sm text-muted transition hover:text-brand">
-              See all {fresh.length} →
+            <Link href="/explore?view=fresh" className="mt-3 inline-flex items-center text-sm text-muted transition hover:text-brand max-sm:min-h-[44px]">
+              See all {freshCount} →
             </Link>
           )}
         </Section>

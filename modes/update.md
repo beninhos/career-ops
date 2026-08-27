@@ -46,6 +46,10 @@ Present to the user as a clear summary:
 >
 > Your personal files (CV, profile, tracker, reports) will NOT be touched.
 
+`changelog` can come back empty, either because the release carries no notes or because the check resolved the version without reading the releases API. Do not render the **Changelog:** line when that happens — a lone `> **Changelog:**` with nothing under it reads as a failure, and nothing failed. Use this in place of those two lines:
+
+> **Changelog:** not available for v{remote}. The release notes are at https://github.com/santifer/career-ops/releases
+
 If the user wants details on specific files, show the actual diff for those files using `git diff HEAD..FETCH_HEAD -- {path}`.
 
 ## Step 3 — Compatibility Check
@@ -94,6 +98,9 @@ If yes:
        > "Your _profile.md references archetype '{old_name}' which was removed in the new _shared.md. Want me to delete the reference or replace it with another archetype?"
 8. Show final status:
    > "✅ Updated to v{version}. Run `node doctor.mjs` anytime to verify setup."
+
+   If the updater's output ended with its note about the CareerOps Manifesto, relay it once (do not drop it when summarizing):
+   > "One more thing: this project ships with the CareerOps Manifesto — a new way of job searching is taking shape, and you are already practicing it. Run `npm run manifesto` to read it and sign it if you want to help. No action needed."
 
 If no:
 1. Run `node update-system.mjs dismiss`

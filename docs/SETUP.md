@@ -18,7 +18,7 @@ npx @santifer/career-ops init
 
 ```bash
 cd career-ops
-claude   # or gemini / codex / qwen / opencode / agy / grok
+claude   # or codex / qwen / opencode / agy / grok
 ```
 
 **On first launch, career-ops walks you through setup by chatting** — it asks for your CV, your details (name, target roles, salary), and sets up the job scanner with pre-configured companies. Nothing to edit by hand: just answer its questions. Then paste a job offer URL or description and it evaluates it, writes a report, generates a tailored PDF, and tracks it.
@@ -59,6 +59,20 @@ npm install
 Then open your AI CLI in the folder — the same first-run onboarding applies. Use this path if you want to track a specific branch, contribute, or audit the code before installing dependencies.
 
 </details>
+
+### Contributing for the first time
+
+If you want to contribute to career-ops, start with a small, focused change. Bug fixes, documentation, translations, and new zero-auth scanner providers can go straight to a pull request; new features, modes, commands, or architecture changes should start with an issue first.
+
+The basic workflow is:
+
+1. Fork the repository and create a branch from `main`.
+2. Make one focused change and keep personal data such as `cv.md`, `profile.yml`, applications, and reports out of the commit.
+3. Run the relevant checks; for a broad validation, use `node test-all.mjs --quick`.
+4. Commit and push your branch to your fork.
+5. Open a pull request against `santifer/career-ops` and explain what changed and why.
+
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full contribution guidelines and examples of good first contributions.
 
 ### PDF rendering (one-time)
 

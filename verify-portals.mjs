@@ -27,11 +27,14 @@
 
 import { existsSync, readFileSync } from 'fs';
 import { dirname, resolve } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
-import yaml from 'js-yaml';
+import { fileURLToPath } from 'url';
+import * as yaml from 'js-yaml';
 
-import { fetchJson as defaultFetchJson, makeHttpCtx } from './providers/_http.mjs';
+import { fetchJson as defaultFetchJson, fetchTextHead as defaultFetchText, makeHttpCtx } from './providers/_http.mjs';
+import { decodeEntities } from './providers/_html-entities.mjs';
+import { asciiFold } from './lib/ascii-fold.mjs';
 import { loadProviders, resolveProvider } from './providers/_registry.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
 
 const DEFAULT_PORTALS_PATH = process.env.CAREER_OPS_PORTALS || 'portals.yml';
 
@@ -47,15 +50,32 @@ export const ATS = {
     probeUrl: (slug) =>
       `https://boards-api.greenhouse.io/v1/boards/${slug}/jobs`,
     jobCount: (json) => (Array.isArray(json?.jobs) ? json.jobs.length : null),
+    // The board root publishes its owner: {"name":"Stripe","content":""}. The
+    // Ashby and Lever posting APIs answer no such question, so those two read
+    // their owner off the board page <title> instead (see below).
+    ownerUrl: (slug) => `https://boards-api.greenhouse.io/v1/boards/${slug}`,
+    ownerKind: 'json',
+    ownerName: (json) => (typeof json?.name === 'string' ? json.name.trim() : null),
   },
   ashby: {
     probeUrl: (slug) =>
       `https://api.ashbyhq.com/posting-api/job-board/${slug}?includeCompensation=true`,
     jobCount: (json) => (Array.isArray(json?.jobs) ? json.jobs.length : null),
+    // The posting API returns only {jobs, apiVersion}; the board page titles
+    // itself with the owner ('deepset Jobs'), which is the only name either
+    // Ashby or Lever exposes publicly (#3019).
+    ownerUrl: (slug) => `https://jobs.ashbyhq.com/${slug}`,
+    ownerKind: 'html',
+    ownerName: (html) => boardTitleOwner(html),
   },
   lever: {
-    probeUrl: (slug) => `https://api.lever.co/v0/postings/${slug}`,
+    // EU boards (jobs.eu.lever.co) resolve to api.eu.lever.co, mirroring the
+    // provider's resolveApiUrl; the default is the base instance.
+    probeUrl: (slug, { eu = false } = {}) => `https://api.${eu ? 'eu.' : ''}lever.co/v0/postings/${slug}`,
     jobCount: (json) => (Array.isArray(json) ? json.length : null),
+    ownerUrl: (slug, { eu = false } = {}) => `https://jobs.${eu ? 'eu.' : ''}lever.co/${slug}`,
+    ownerKind: 'html',
+    ownerName: (html) => boardTitleOwner(html),
   },
 };
 
@@ -71,22 +91,42 @@ const ATS_URL_PATTERNS = [
   { ats: 'greenhouse', re: /boards\.greenhouse\.io\/([^/?#]+)/ },
   { ats: 'ashby', re: /api\.ashbyhq\.com\/posting-api\/job-board\/([^/?#]+)/ },
   { ats: 'ashby', re: /jobs\.ashbyhq\.com\/([^/?#]+)/ },
-  { ats: 'lever', re: /api\.lever\.co\/v0\/postings\/([^/?#]+)/ },
-  { ats: 'lever', re: /jobs\.lever\.co\/([^/?#]+)/ },
+  // Lever entries pin an exact `host` (checked via new URL(), like
+  // providers/lever.mjs's resolveApiUrl) instead of matching the hostname as a
+  // loose substring anywhere in the URL — otherwise a crafted
+  // https://evil.com/jobs.lever.co/x careers_url would falsely resolve as Lever.
+  { ats: 'lever', host: 'api.eu.lever.co', re: /^\/v0\/postings\/([^/?#]+)/, eu: true },
+  { ats: 'lever', host: 'jobs.eu.lever.co', re: /^\/([^/?#]+)/, eu: true },
+  { ats: 'lever', host: 'api.lever.co', re: /^\/v0\/postings\/([^/?#]+)/ },
+  { ats: 'lever', host: 'jobs.lever.co', re: /^\/([^/?#]+)/ },
 ];
 
 /**
  * Identify the ATS and slug embedded in a careers_url or api URL.
  *
  * @param {string} url - A `careers_url` or `api` value from portals.yml.
- * @returns {{ats: string, slug: string}|null} Match, or null for non-ATS URLs
- *   (branded careers pages, Workday, job boards, etc.) which this tool skips.
+ * @returns {{ats: string, slug: string, eu?: boolean}|null} Match, or null for
+ *   non-ATS URLs (branded careers pages, Workday, job boards, etc.) which this
+ *   tool skips. `eu` is set for Lever's EU data-residency instance.
  */
 export function parseAtsSlug(url) {
   const text = String(url || '');
-  for (const { ats, re } of ATS_URL_PATTERNS) {
+  let hostname = null;
+  let pathname = null;
+  try {
+    ({ hostname, pathname } = new URL(text));
+  } catch {
+    // Not a parseable absolute URL — host-scoped patterns below simply won't match.
+  }
+  for (const { ats, re, eu, host } of ATS_URL_PATTERNS) {
+    if (host) {
+      if (hostname !== host) continue;
+      const m = pathname.match(re);
+      if (m && m[1]) return eu ? { ats, slug: m[1], eu: true } : { ats, slug: m[1] };
+      continue;
+    }
     const m = text.match(re);
-    if (m && m[1]) return { ats, slug: m[1] };
+    if (m && m[1]) return eu ? { ats, slug: m[1], eu: true } : { ats, slug: m[1] };
   }
   return null;
 }
@@ -99,22 +139,44 @@ export function parseAtsSlug(url) {
  * boards use just the brand, e.g. 'Acme Corp' → 'acme'). Order is deterministic
  * and duplicates are removed so `--add` probes each distinct candidate once.
  *
+ * SUFFIXES ON THE FIRST WORD ARE PROBE-ONLY (#2937). Every other candidate here
+ * either reformats the whole name ('nimbus-data'), abbreviates it without
+ * adding anything ('nimbus'), or extends it ('nimbusdataai'). Building a suffix
+ * on the FIRST WORD is the one rule that both drops part of the name AND
+ * substitutes a token for what it dropped, so what comes out is not a form of
+ * this company's name, it is a different company's: 'Nimbus Data' yields
+ * 'nimbusai', 'nimbustech', 'nimbuslabs'. The rule has no legitimate yield to
+ * lose either. When the name already ends in a suffix word ('Scale AI'), it
+ * just reproduces words.join('') and is deduped away, so every candidate it
+ * contributes uniquely belongs to somebody else.
+ *
+ * Offering those to `--add` is fine: an operator reads the slug beside the
+ * company name and picks one, and a wrong guess costs a 404. Offering them to
+ * discoverAlternates is not. That result is attached as `suggested`, and
+ * `fix-slugs --fix` writes it into portals.yml with no further identity check,
+ * after which scan.mjs labels the other employer's postings with this
+ * company's name. Pass `firstWordSuffixes: false` on any path that writes.
+ *
+ * The bare first word stays on both paths deliberately: many boards really are
+ * just the brand ('Acme Corp' → 'acme'), and it adds no token that the company
+ * does not have. It is a narrower risk than this change addresses, not a
+ * blessed one.
+ *
  * @param {string} name - Company display name.
+ * @param {{firstWordSuffixes?: boolean}} [opts] - `false` omits the suffix
+ *   variants built on the first word alone.
  * @returns {string[]} Distinct candidate slugs, most-specific first.
  */
 const SLUG_SUFFIXES = ['ai', 'tech', 'io', 'hq', 'labs'];
 
-export function deriveSlugCandidates(name) {
-  const lower = String(name || '')
-    .toLowerCase()
-    .trim();
-  if (!lower) return [];
-  const words = lower
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter(Boolean);
+export function deriveSlugCandidates(name, { firstWordSuffixes = true } = {}) {
+  if (!String(name ?? '').trim()) return [];
+  // ASCII-fold BEFORE splitting. The previous `[^a-z0-9\s]` pass turned an
+  // accented letter into a SEPARATOR, so "Telefónica" became the two words
+  // "telef nica" and never produced "telefonica" — the slug the board actually
+  // uses — while "Société Générale" shattered into four fragments and even the
+  // first-word heuristic above yielded "soci" (#2930).
+  const words = asciiFold(name).split(' ').filter(Boolean);
   if (words.length === 0) return [];
   const candidates = [
     words.join(''), // acmecorp
@@ -122,7 +184,7 @@ export function deriveSlugCandidates(name) {
     words.join('_'), // acme_corp
     words[0], // acme
   ];
-  const bases = [words.join(''), words[0]].filter(Boolean);
+  const bases = (firstWordSuffixes ? [words.join(''), words[0]] : [words.join('')]).filter(Boolean);
   for (const base of bases) {
     for (const suf of SLUG_SUFFIXES) candidates.push(`${base}${suf}`);
     candidates.push(`${base}.tech`, `${base}.io`);
@@ -158,7 +220,8 @@ export function classifyFetchError(err) {
  *
  * @param {string} ats - Key into ATS (greenhouse | ashby | lever).
  * @param {string} slug - Candidate slug to probe.
- * @param {{fetchJson?: Function}} [deps] - Injectable HTTP for testability.
+ * @param {{fetchJson?: Function, eu?: boolean}} [deps] - Injectable HTTP for
+ *   testability; `eu` selects Lever's EU data-residency instance.
  * @returns {Promise<{ats,slug,url,status,jobCount?,httpStatus?,errorKind?,reason?}>}
  *   status is 'live' (jobs > 0), 'empty' (200, no jobs), or 'missing'
  *   (404/error/unexpected shape).
@@ -166,7 +229,7 @@ export function classifyFetchError(err) {
 export async function probeSlug(
   ats,
   slug,
-  { fetchJson = defaultFetchJson } = {},
+  { fetchJson = defaultFetchJson, eu = false } = {},
 ) {
   const spec = ATS[ats];
   if (!spec)
@@ -178,7 +241,7 @@ export async function probeSlug(
       errorKind: 'unknown',
       reason: `unknown ATS: ${ats}`,
     };
-  const url = spec.probeUrl(slug);
+  const url = spec.probeUrl(slug, { eu });
   try {
     const json = await fetchJson(url);
     const count = spec.jobCount(json);
@@ -211,14 +274,164 @@ export async function probeSlug(
   }
 }
 
-/** Probe slug variants across all ATSes; prefer live boards over empty ones. */
-async function discoverAlternates(name, { fetchJson }) {
+/**
+ * Pull the board owner's name out of a careers page <title>.
+ *
+ * Both providers title the board after its owner and append a jobs suffix:
+ * 'deepset Jobs' on Ashby, 'Diabolocom' or 'Lever Demo 2' on Lever. The suffix is
+ * stripped when present; everything else is left for canonicalNameTokens to judge.
+ *
+ * @param {string} html - The head of the board page.
+ * @returns {string|null} The owner name, or null when no title is present.
+ */
+export function boardTitleOwner(html) {
+  const m = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(String(html || ''));
+  if (!m) return null;
+  // Decode before collapsing whitespace: `&nbsp;` is a space once decoded, and
+  // collapsing first would leave it as literal text in the middle of a name.
+  const title = decodeEntities(m[1]).replace(/\s+/g, ' ').trim();
+  if (!title) return null;
+  return title.replace(/\s+jobs$/i, '').trim() || null;
+}
+
+// Tokens that carry no identity. A leading article and a trailing legal designator
+// can differ between how a company writes its name and how its ATS board is titled,
+// so they are dropped before comparing. Nothing else is: 'Systems', 'AI', 'Airlines'
+// and 'Grumman' are exactly what distinguishes Mercury Systems from Mercury.
+const NAME_ARTICLES = new Set(['the']);
+const NAME_DESIGNATORS = new Set([
+  'inc', 'incorporated', 'llc', 'llp', 'lp', 'ltd', 'limited', 'plc', 'corp',
+  'corporation', 'co', 'company', 'gmbh', 'ag', 'kg', 'sa', 'sas', 'sarl', 'srl',
+  'spa', 'bv', 'nv', 'ab', 'as', 'oy', 'aps', 'pty', 'pte', 'kk', 'kft',
+]);
+
+/**
+ * Reduce a company or board name to the tokens that actually identify it.
+ *
+ * Accents fold through the shared `asciiFold` (Café -> cafe), which also carries
+ * the Latin letters NFD does not decompose — Işık -> isik, Møller -> moller,
+ * Großmann -> grossmann, Đại -> dai — where a bare strip-the-marks pass deletes
+ * the letter outright (#2930).
+ *
+ * THE AMPERSAND RULE RUNS BEFORE THE FOLD, AND THE ORDER IS LOAD-BEARING.
+ * A spaced ampersand is a word ('Hims & Hers' -> hims and hers); an unspaced one
+ * is punctuation ('AT&T' -> att). Only the raw string still tells them apart:
+ * `asciiFold` has resolved every '&' by the time it returns, whichever
+ * `punctuation` mode it ran in. Fold first and 'Hims & Hers' silently loses its
+ * 'and' under 'delete', or 'AT&T' splits into two tokens under 'space'.
+ *
+ * `punctuation: 'delete'` because these tokens are compared for EQUALITY, never
+ * substring-matched, so a hyphen or apostrophe must keep joining its word
+ * ("L'Oréal" -> loreal) exactly as the inline strip this replaced did.
+ * Whitespace is collapsed to single spaces first, so 'delete' — which removes a
+ * tab rather than collapsing it — cannot weld two words together.
+ *
+ * A leading article and any trailing legal designators are dropped afterwards.
+ *
+ * @param {string} name
+ * @returns {string[]} Canonical identifying tokens.
+ */
+function canonicalNameTokens(name) {
+  const spaced = String(name || '').replace(/\s+/g, ' ');
+  const words = asciiFold(spaced.replace(/\s+&\s+/g, ' and '), { punctuation: 'delete' })
+    .split(' ')
+    .filter(Boolean);
+  let start = 0;
+  if (words.length > 1 && NAME_ARTICLES.has(words[0])) start = 1;
+  let end = words.length;
+  while (end - start > 1 && NAME_DESIGNATORS.has(words[end - 1])) end -= 1;
+  return words.slice(start, end);
+}
+
+/**
+ * Does a discovered board's owner name refer to the company we are repairing?
+ *
+ * Canonical equality, deliberately not a prefix. A shorter tracked name is not
+ * evidence that a longer board name is the same company: Mercury and Mercury
+ * Systems, Scale and Scale AI, Northrop and Northrop Grumman are all real and
+ * distinct. A prefix-only match ('Nimbus Data' against a board named 'Nimbus')
+ * may well be the same company, but this path writes portals.yml unreviewed, so
+ * it goes to `--add` where a human can judge it rather than being adopted here.
+ *
+ * @param {string} companyName - The tracked company being repaired.
+ * @param {string} boardName - The name the ATS reports for the probed board.
+ * @returns {boolean} True only when both canonicalize to the same tokens.
+ */
+export function boardIdentityMatches(companyName, boardName) {
+  const a = canonicalNameTokens(companyName);
+  const b = canonicalNameTokens(boardName);
+  if (!a.length || !b.length) return false;
+  return a.length === b.length && a.every((tok, i) => tok === b[i]);
+}
+
+/**
+ * Confirm a candidate board belongs to this company before it can be written.
+ *
+ * Fails CLOSED for any ATS that publishes an owner, and does not distinguish
+ * "owned by someone else" from "could not ask": both mean unconfirmed, and an
+ * unconfirmed board must not be written into portals.yml unreviewed. A missed
+ * suggestion costs an operator one `--add`, where the slug is shown beside the
+ * company name; a wrong one relabels another employer's postings in scan.mjs.
+ * The reason is recorded so a transient outage is not read as a mismatch.
+ *
+ * Every ATS in the table above publishes an owner, so all three are confirmed
+ * here. The `no-owner-endpoint` pass-through is a guard for a FUTURE entry that
+ * defines no `ownerUrl`: it keeps this function total instead of throwing on
+ * one. Such an entry would need its own identity signal before boards found on
+ * it could be adopted, so the reason is returned rather than swallowed.
+ */
+async function ownerConfirmed(ats, slug, companyName, { fetchJson, fetchText, eu = false, cache }) {
+  const spec = ATS[ats];
+  if (!spec?.ownerUrl) return { ok: true, reason: 'no-owner-endpoint' };
+  const key = `${ats}|${eu ? 'eu' : 'base'}|${slug}`;
+  if (cache?.has(key)) return cache.get(key);
+  let out;
+  try {
+    const url = spec.ownerUrl(slug, { eu });
+    const raw = spec.ownerKind === 'html' ? await fetchText(url) : await fetchJson(url);
+    const boardName = spec.ownerName(raw);
+    if (!boardName) out = { ok: false, reason: 'owner-unnamed' };
+    else if (boardIdentityMatches(companyName, boardName)) out = { ok: true, reason: 'owner-match', boardName };
+    else out = { ok: false, reason: 'owner-mismatch', boardName };
+  } catch (err) {
+    // A 404 here means the board root is gone; anything else (429, 5xx, network)
+    // means we could not ask. Neither confirms identity, but they are different
+    // facts and the summary should not report an outage as somebody else's board.
+    out = { ok: false, reason: classifyFetchError(err) === 'slug_gone' ? 'owner-absent' : 'owner-unreachable' };
+  }
+  cache?.set(key, out);
+  return out;
+}
+
+/**
+ * Probe slug variants across all ATSes; prefer live boards over empty ones.
+ *
+ * No first-word suffix variants (#2937). Nothing downstream re-checks identity:
+ * the winner is attached as `suggested` and `fix-slugs --fix` writes it into
+ * portals.yml, so 'Nimbus Data' adopting the live board 'nimbusai' silently
+ * relabels Nimbus AI's postings. Those candidates are never this company's name
+ * to begin with, so dropping them here costs nothing and they stay available to
+ * `--add`, where an operator sees the slug beside the name before adopting it.
+ */
+async function discoverAlternates(name, { fetchJson, fetchText }) {
   let bestEmpty = null;
-  for (const slug of deriveSlugCandidates(name)) {
+  // One owner lookup per (ats, eu, slug) per company, so the added identity check
+  // cannot multiply requests when candidates repeat across the probe order.
+  const cache = new Map();
+  for (const slug of deriveSlugCandidates(name, { firstWordSuffixes: false })) {
     for (const ats of Object.keys(ATS)) {
-      const r = await probeSlug(ats, slug, { fetchJson });
-      if (r.status === 'live') return r;
-      if (r.status === 'empty' && !bestEmpty) bestEmpty = r;
+      // Lever no longer has a separate 'lever-eu' registry key (unified into a
+      // single 'lever' + eu flag), so both instances must be probed explicitly
+      // here or EU-only tenants become undiscoverable via --add.
+      const euVariants = ats === 'lever' ? [false, true] : [false];
+      for (const eu of euVariants) {
+        const r = await probeSlug(ats, slug, { fetchJson, eu });
+        if (r.status !== 'live' && r.status !== 'empty') continue;
+        const owner = await ownerConfirmed(ats, slug, name, { fetchJson, fetchText, eu, cache });
+        if (!owner.ok) continue;
+        if (r.status === 'live') return r;
+        if (!bestEmpty) bestEmpty = r;
+      }
     }
   }
   return bestEmpty;
@@ -227,30 +440,48 @@ async function discoverAlternates(name, { fetchJson }) {
 /**
  * A liveness probe must never paginate an entire board — that is slow and rude
  * to the careers site (many rate-limit or bot-block aggressively). We signal
- * this sentinel when a provider tries to fetch a second page; the probe reads it
- * as "the first page came back fine → the endpoint is live", we just don't learn
- * the exact total. Distinct from a real HTTP error, which means a broken board.
+ * this sentinel when a provider exhausts its request budget; the probe reads it
+ * as "the budgeted pages came back fine → the endpoint is live", we just don't
+ * learn the exact total. Distinct from a real HTTP error (a broken board).
  */
 class ProbePageBudgetReached extends Error {}
 
 /**
- * Wrap an http context so a provider gets exactly ONE successful list request.
+ * A handful of requests, not one: some providers must spend requests before
+ * the first job can arrive — SuccessFactors CSB does a locale-discovery GET,
+ * then one POST per advertised locale until it hits the job-bearing one. A
+ * 1-request budget would misreport every such tenant as 'empty'.
+ */
+const PROBE_REQUEST_BUDGET = 4;
+
+/**
+ * Wrap an http context so a provider gets a bounded number of successful list
+ * requests (PROBE_REQUEST_BUDGET).
  *
  * Cooperating providers also see `maxPages: 1` and stop on their own (we then
- * learn the first-page count). Providers that ignore the hint are cut off at
- * their second request via the sentinel above — so the probe is bounded for
- * every provider, whether or not it honors `maxPages`.
+ * learn the first-page count). Providers that ignore the hint are cut off via
+ * the sentinel above — so the probe is bounded for every provider, whether or
+ * not it honors `maxPages`. `wasTripped()` reports a cut-off even when the
+ * provider swallowed the sentinel internally (e.g. a per-locale try/catch).
  *
  * @param {import('./providers/_types.js').Context} base
+ * @returns {{ctx: import('./providers/_types.js').Context, wasTripped: () => boolean}}
  */
 function boundedProbeCtx(base) {
   let used = 0;
+  let tripped = false;
   const guard = (fn) => async (url, opts) => {
-    if (used >= 1) throw new ProbePageBudgetReached();
+    if (used >= PROBE_REQUEST_BUDGET) {
+      tripped = true;
+      throw new ProbePageBudgetReached();
+    }
     used += 1;
     return fn(url, opts);
   };
-  return { ...base, maxPages: 1, fetchJson: guard(base.fetchJson), fetchText: guard(base.fetchText) };
+  return {
+    ctx: { ...base, maxPages: 1, fetchJson: guard(base.fetchJson), fetchText: guard(base.fetchText) },
+    wasTripped: () => tripped,
+  };
 }
 
 /**
@@ -262,15 +493,25 @@ function boundedProbeCtx(base) {
  * @returns {Promise<{provider,status,jobCount?,partial?,httpStatus?,errorKind?,reason?}>}
  *   status is 'live' (postings found), 'empty' (endpoint OK, no postings), or
  *   'missing' (the board 404s/errors — the company would silently drop from
- *   every scan). `partial` marks a live board whose exact count the one-page
+ *   every scan). `partial` marks a live board whose exact count the bounded
  *   probe didn't measure.
  */
 export async function probeProvider(entry, provider, baseCtx) {
-  const ctx = boundedProbeCtx(baseCtx);
+  const { ctx, wasTripped } = boundedProbeCtx(baseCtx);
   try {
     const jobs = await provider.fetch(entry, ctx);
     const count = Array.isArray(jobs) ? jobs.length : 0;
-    return { provider: provider.id, status: count > 0 ? 'live' : 'empty', jobCount: count };
+    if (count > 0) {
+      const result = { provider: provider.id, status: 'live', jobCount: count };
+      if (wasTripped()) result.partial = true;
+      return result;
+    }
+    // Zero jobs but the budget guard fired: the provider swallowed the sentinel
+    // (per-locale/per-page try/catch) after its budgeted requests all came back
+    // fine — the endpoint is reachable, we just never reached a job-bearing
+    // page. Same verdict as the propagated-sentinel case below.
+    if (wasTripped()) return { provider: provider.id, status: 'live', partial: true };
+    return { provider: provider.id, status: 'empty', jobCount: 0 };
   } catch (err) {
     if (err instanceof ProbePageBudgetReached) {
       return { provider: provider.id, status: 'live', partial: true };
@@ -293,7 +534,7 @@ export async function probeProvider(entry, provider, baseCtx) {
  *      with cross-probe suggestions when a slug 404s.
  *   2. Everything else is routed through the SAME provider plugins the scanner
  *      uses (Workday, SuccessFactors, SmartRecruiters, Avature, …), bounded to
- *      the first page. This catches broken non-ATS boards that used to be
+ *      a few requests. This catches broken non-ATS boards that used to be
  *      reported as an un-actionable "skipped".
  * A company reaches `skipped` only when no provider claims it. Probing is
  * sequential to stay gentle on rate limits.
@@ -306,7 +547,7 @@ export async function probeProvider(entry, provider, baseCtx) {
  */
 export async function verifyCompanies(
   companies,
-  { fetchJson = defaultFetchJson, providers = null, httpCtx = null } = {},
+  { fetchJson = defaultFetchJson, fetchText = defaultFetchText, providers = null, httpCtx = null } = {},
 ) {
   const list = Array.isArray(companies) ? companies : [];
   const results = [];
@@ -317,14 +558,14 @@ export async function verifyCompanies(
     const match =
       parseAtsSlug(company.api) || parseAtsSlug(company.careers_url);
     if (match) {
-      const probe = await probeSlug(match.ats, match.slug, { fetchJson });
+      const probe = await probeSlug(match.ats, match.slug, { fetchJson, eu: match.eu });
       if (probe.status === 'live' || probe.status === 'empty') {
         results.push({ name, ...probe });
         continue;
       }
       // Wrong slug or ATS migration — cross-probe only for slug/unknown failures.
       if (probe.errorKind === 'slug_gone' || probe.errorKind === 'unknown') {
-        const suggested = await discoverAlternates(name, { fetchJson });
+        const suggested = await discoverAlternates(name, { fetchJson, fetchText });
         if (suggested) {
           results.push({ name, ...probe, suggested });
           continue;
@@ -412,7 +653,18 @@ function printResults(results) {
 async function runAdd(name, { fetchJson }) {
   const candidates = deriveSlugCandidates(name);
   if (candidates.length === 0) {
-    console.error('verify-portals: --add needs a company name');
+    // Distinguish "you gave me nothing" from "nothing sluggable survived".
+    // A CJK/Cyrillic/Greek name folds to '' because ATS slugs are ASCII, and
+    // reporting that as a missing argument told the user they had omitted an
+    // argument they did supply (#2930).
+    if (!String(name ?? '').trim()) {
+      console.error('verify-portals: --add needs a company name');
+    } else {
+      console.error(
+        `verify-portals: no ASCII slug can be derived from '${name}' — ` +
+        'ATS slugs are ASCII, so pass the latinized brand name (or add the board URL to portals.yml directly).',
+      );
+    }
     process.exit(1);
   }
   console.log(
@@ -506,7 +758,7 @@ async function main() {
 
 // Only run main() when invoked directly (`node verify-portals.mjs`), not when
 // imported by tests. `|| ''` guards `node -e` invocations with no script arg.
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+if (isMainModule(import.meta.url)) {
   main().catch((err) => {
     console.error(`verify-portals failed: ${err.message}`);
     process.exit(1);
